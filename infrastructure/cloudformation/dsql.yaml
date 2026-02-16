@@ -1,0 +1,49 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Aurora DSQL Cluster for Benchmarking'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name prefix for resources
+    Type: String
+    Default: dsql-benchmark
+
+  DeletionProtection:
+    Description: Enable deletion protection for the DSQL cluster
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Resources:
+  # Aurora DSQL Cluster
+  DSQLCluster:
+    Type: AWS::DSQL::Cluster
+    Properties:
+      DeletionProtectionEnabled: !Ref DeletionProtection
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-dsql-cluster
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: Benchmarking
+
+Outputs:
+  DSQLClusterIdentifier:
+    Description: Aurora DSQL Cluster Identifier
+    Value: !Ref DSQLCluster
+    Export:
+      Name: !Sub ${EnvironmentName}-DSQLClusterIdentifier
+
+  DSQLClusterEndpoint:
+    Description: Aurora DSQL Cluster Endpoint
+    Value: !GetAtt DSQLCluster.Endpoint
+    Export:
+      Name: !Sub ${EnvironmentName}-DSQLClusterEndpoint
+
+  DSQLClusterArn:
+    Description: Aurora DSQL Cluster ARN
+    Value: !GetAtt DSQLCluster.ResourceArn
+    Export:
+      Name: !Sub ${EnvironmentName}-DSQLClusterArn

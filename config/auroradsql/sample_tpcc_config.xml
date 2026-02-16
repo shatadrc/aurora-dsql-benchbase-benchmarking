@@ -25,10 +25,10 @@
     <retries>4</retries>
 
     <!-- Scale factor is the number of warehouses in TPCC -->
-    <scalefactor>200</scalefactor>
+    <scalefactor>20</scalefactor>
 
     <!-- The workload -->
-    <terminals>200</terminals>
+    <terminals>20</terminals>
     <works>
         <work>
             <time>7200</time>

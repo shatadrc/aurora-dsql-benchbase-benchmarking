@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM resources for DSQL Benchmarking Cluster - Role and Instance Profile with DSQL permissions'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name prefix for resources
+    Type: String
+    Default: dsql-benchmark
+
+Resources:
+  # IAM Role for EC2 Benchmark Instances
+  BenchmarkInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-instance-role
+      Description: IAM role for DSQL benchmark EC2 instances with Aurora DSQL access
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # SSM for instance management (optional but recommended)
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        # Aurora DSQL Full Access Policy
+        - PolicyName: AuroraDSQLAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DSQLClusterAccess
+                Effect: Allow
+                Action:
+                  - dsql:*
+                Resource: '*'
+              - Sid: DSQLDbConnectAdmin
+                Effect: Allow
+                Action:
+                  - dsql:DbConnectAdmin
+                Resource: '*'
+              - Sid: DSQLDbConnect
+                Effect: Allow
+                Action:
+                  - dsql:DbConnect
+                Resource: '*'
+        # CloudWatch Metrics Policy (for publishing benchmark metrics)
+        - PolicyName: CloudWatchMetricsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+        # S3 Access for benchmark results (optional)
+        - PolicyName: S3BenchmarkResults
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3ResultsBucketAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${EnvironmentName}-results-*
+                  - !Sub arn:aws:s3:::${EnvironmentName}-results-*/*
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-instance-role
+
+  # Instance Profile for EC2 Instances
+  BenchmarkInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${EnvironmentName}-instance-profile
+      Roles:
+        - !Ref BenchmarkInstanceRole
+
+Outputs:
+  BenchmarkInstanceRoleArn:
+    Description: ARN of the benchmark instance IAM role
+    Value: !GetAtt BenchmarkInstanceRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstanceRoleArn
+
+  BenchmarkInstanceRoleName:
+    Description: Name of the benchmark instance IAM role
+    Value: !Ref BenchmarkInstanceRole
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstanceRoleName
+
+  BenchmarkInstanceProfileArn:
+    Description: ARN of the benchmark instance profile
+    Value: !GetAtt BenchmarkInstanceProfile.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstanceProfileArn
+
+  BenchmarkInstanceProfileName:
+    Description: Name of the benchmark instance profile
+    Value: !Ref BenchmarkInstanceProfile
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstanceProfileName
