@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2 instances for DSQL Benchmarking Cluster - 3 x c5.2xlarge instances across AZs'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name prefix for resources
+    Type: String
+    Default: dsql-benchmark
+
+  InstanceType:
+    Description: EC2 instance type for benchmark instances
+    Type: String
+    Default: c5.2xlarge
+    AllowedValues:
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+      - c5.4xlarge
+      - c5.9xlarge
+      - c5.18xlarge
+      - c6i.large
+      - c6i.xlarge
+      - c6i.2xlarge
+      - c6i.4xlarge
+
+  KeyPairName:
+    Description: Name of an existing EC2 key pair for SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair
+
+  AmiId:
+    Description: Amazon Linux 2023 AMI ID (defaults to latest AL2023 with Java 21 support)
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  RootVolumeSize:
+    Description: Size of root EBS volume in GB
+    Type: Number
+    Default: 100
+    MinValue: 30
+    MaxValue: 500
+
+Resources:
+  # EC2 Instance 1 (us-east-1a)
+  BenchmarkInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-PublicSubnet1
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-BenchmarkSecurityGroupId
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: ${EnvironmentName}-BenchmarkInstanceProfileName
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Log all output
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          echo "Starting EC2 instance setup..."
+          
+          # Update system packages
+          dnf update -y
+          
+          # Install Java 21 (Amazon Corretto)
+          dnf install -y java-21-amazon-corretto-headless
+          
+          # Install required tools
+          dnf install -y git wget curl unzip jq htop
+          
+          # Set JAVA_HOME
+          echo 'export JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto' >> /etc/profile.d/java.sh
+          echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile.d/java.sh
+          source /etc/profile.d/java.sh
+          
+          # Verify Java installation
+          java -version
+          
+          # Create benchmark directory
+          mkdir -p /opt/benchmark
+          chown ec2-user:ec2-user /opt/benchmark
+          
+          # Clone the benchbase repository
+          cd /opt/benchmark
+          git clone --depth 1 https://github.com/amazon-contributing/aurora-dsql-benchbase-benchmarking.git
+          chown -R ec2-user:ec2-user aurora-dsql-benchbase-benchmarking
+          
+          # Build benchbase with auroradsql profile
+          cd aurora-dsql-benchbase-benchmarking
+          sudo -u ec2-user ./mvnw clean package -P auroradsql -DskipTests
+          
+          # Extract the built artifact
+          cd target
+          sudo -u ec2-user tar xvzf benchbase-auroradsql.tgz
+          
+          # Create environment variables file
+          cat > /opt/benchmark/benchmark-env.sh << 'ENVEOF'
+          export JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto
+          export PATH=$JAVA_HOME/bin:$PATH
+          export BENCHMARK_HOME=/opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql
+          export AWS_DEFAULT_REGION=us-east-1
+          export INSTANCE_ID=1
+          export TOTAL_INSTANCES=3
+          ENVEOF
+          
+          # Set instance-specific environment
+          echo "export INSTANCE_AZ=us-east-1a" >> /opt/benchmark/benchmark-env.sh
+          
+          echo "EC2 instance setup completed successfully!"
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-instance-1
+        - Key: InstanceIndex
+          Value: '1'
+        - Key: AvailabilityZone
+          Value: us-east-1a
+
+  # EC2 Instance 2 (us-east-1b)
+  BenchmarkInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-PublicSubnet2
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-BenchmarkSecurityGroupId
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: ${EnvironmentName}-BenchmarkInstanceProfileName
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          echo "Starting EC2 instance setup..."
+          
+          dnf update -y
+          dnf install -y java-21-amazon-corretto-headless
+          dnf install -y git wget curl unzip jq htop
+          
+          echo 'export JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto' >> /etc/profile.d/java.sh
+          echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile.d/java.sh
+          source /etc/profile.d/java.sh
+          
+          java -version
+          
+          mkdir -p /opt/benchmark
+          chown ec2-user:ec2-user /opt/benchmark
+          
+          cd /opt/benchmark
+          git clone --depth 1 https://github.com/amazon-contributing/aurora-dsql-benchbase-benchmarking.git
+          chown -R ec2-user:ec2-user aurora-dsql-benchbase-benchmarking
+          
+          cd aurora-dsql-benchbase-benchmarking
+          sudo -u ec2-user ./mvnw clean package -P auroradsql -DskipTests
+          
+          cd target
+          sudo -u ec2-user tar xvzf benchbase-auroradsql.tgz
+          
+          cat > /opt/benchmark/benchmark-env.sh << 'ENVEOF'
+          export JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto
+          export PATH=$JAVA_HOME/bin:$PATH
+          export BENCHMARK_HOME=/opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql
+          export AWS_DEFAULT_REGION=us-east-1
+          export INSTANCE_ID=2
+          export TOTAL_INSTANCES=3
+          ENVEOF
+          
+          echo "export INSTANCE_AZ=us-east-1b" >> /opt/benchmark/benchmark-env.sh
+          
+          echo "EC2 instance setup completed successfully!"
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-instance-2
+        - Key: InstanceIndex
+          Value: '2'
+        - Key: AvailabilityZone
+          Value: us-east-1b
+
+  # EC2 Instance 3 (us-east-1c)
+  BenchmarkInstance3:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-PublicSubnet3
+      SecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-BenchmarkSecurityGroupId
+      IamInstanceProfile: !ImportValue
+        Fn::Sub: ${EnvironmentName}-BenchmarkInstanceProfileName
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          echo "Starting EC2 instance setup..."
+          
+          dnf update -y
+          dnf install -y java-21-amazon-corretto-headless
+          dnf install -y git wget curl unzip jq htop
+          
+          echo 'export JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto' >> /etc/profile.d/java.sh
+          echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile.d/java.sh
+          source /etc/profile.d/java.sh
+          
+          java -version
+          
+          mkdir -p /opt/benchmark
+          chown ec2-user:ec2-user /opt/benchmark
+          
+          cd /opt/benchmark
+          git clone --depth 1 https://github.com/amazon-contributing/aurora-dsql-benchbase-benchmarking.git
+          chown -R ec2-user:ec2-user aurora-dsql-benchbase-benchmarking
+          
+          cd aurora-dsql-benchbase-benchmarking
+          sudo -u ec2-user ./mvnw clean package -P auroradsql -DskipTests
+          
+          cd target
+          sudo -u ec2-user tar xvzf benchbase-auroradsql.tgz
+          
+          cat > /opt/benchmark/benchmark-env.sh << 'ENVEOF'
+          export JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto
+          export PATH=$JAVA_HOME/bin:$PATH
+          export BENCHMARK_HOME=/opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql
+          export AWS_DEFAULT_REGION=us-east-1
+          export INSTANCE_ID=3
+          export TOTAL_INSTANCES=3
+          ENVEOF
+          
+          echo "export INSTANCE_AZ=us-east-1c" >> /opt/benchmark/benchmark-env.sh
+          
+          echo "EC2 instance setup completed successfully!"
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-instance-3
+        - Key: InstanceIndex
+          Value: '3'
+        - Key: AvailabilityZone
+          Value: us-east-1c
+
+Outputs:
+  BenchmarkInstance1Id:
+    Description: Instance ID for benchmark instance 1
+    Value: !Ref BenchmarkInstance1
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstance1Id
+
+  BenchmarkInstance1PublicIp:
+    Description: Public IP for benchmark instance 1
+    Value: !GetAtt BenchmarkInstance1.PublicIp
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstance1PublicIp
+
+  BenchmarkInstance1PrivateIp:
+    Description: Private IP for benchmark instance 1
+    Value: !GetAtt BenchmarkInstance1.PrivateIp
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstance1PrivateIp
+
+  BenchmarkInstance2Id:
+    Description: Instance ID for benchmark instance 2
+    Value: !Ref BenchmarkInstance2
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstance2Id
+
+  BenchmarkInstance2PublicIp:
+    Description: Public IP for benchmark instance 2
+    Value: !GetAtt BenchmarkInstance2.PublicIp
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstance2PublicIp
+
+  BenchmarkInstance2PrivateIp:
+    Description: Private IP for benchmark instance 2
+    Value: !GetAtt BenchmarkInstance2.PrivateIp
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstance2PrivateIp
+
+  BenchmarkInstance3Id:
+    Description: Instance ID for benchmark instance 3
+    Value: !Ref BenchmarkInstance3
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstance3Id
+
+  BenchmarkInstance3PublicIp:
+    Description: Public IP for benchmark instance 3
+    Value: !GetAtt BenchmarkInstance3.PublicIp
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstance3PublicIp
+
+  BenchmarkInstance3PrivateIp:
+    Description: Private IP for benchmark instance 3
+    Value: !GetAtt BenchmarkInstance3.PrivateIp
+    Export:
+      Name: !Sub ${EnvironmentName}-BenchmarkInstance3PrivateIp
+
+  AllInstanceIds:
+    Description: All benchmark instance IDs
+    Value: !Join [',', [!Ref BenchmarkInstance1, !Ref BenchmarkInstance2, !Ref BenchmarkInstance3]]
+
+  AllPublicIps:
+    Description: All benchmark instance public IPs
+    Value: !Join [',', [!GetAtt BenchmarkInstance1.PublicIp, !GetAtt BenchmarkInstance2.PublicIp, !GetAtt BenchmarkInstance3.PublicIp]]

@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Main template for DSQL Benchmarking Infrastructure - Deploys all nested stacks'
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name prefix for resources
+    Type: String
+    Default: dsql-benchmark
+
+  VpcCIDR:
+    Description: CIDR block for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnet1CIDR:
+    Description: CIDR block for public subnet in AZ1 (us-east-1a)
+    Type: String
+    Default: 10.0.1.0/24
+
+  PublicSubnet2CIDR:
+    Description: CIDR block for public subnet in AZ2 (us-east-1b)
+    Type: String
+    Default: 10.0.2.0/24
+
+  PublicSubnet3CIDR:
+    Description: CIDR block for public subnet in AZ3 (us-east-1c)
+    Type: String
+    Default: 10.0.3.0/24
+
+  SSHSourceCIDR:
+    Description: CIDR block allowed for SSH access (restrict to your IP for security)
+    Type: String
+    Default: 0.0.0.0/0
+
+  InstanceType:
+    Description: EC2 instance type for benchmark instances
+    Type: String
+    Default: c5.2xlarge
+    AllowedValues:
+      - c5.large
+      - c5.xlarge
+      - c5.2xlarge
+      - c5.4xlarge
+      - c5.9xlarge
+      - c5.18xlarge
+
+  KeyPairName:
+    Description: Name of an existing EC2 key pair for SSH access
+    Type: AWS::EC2::KeyPair::KeyName
+
+  RootVolumeSize:
+    Description: Size of root EBS volume in GB
+    Type: Number
+    Default: 100
+    MinValue: 30
+    MaxValue: 500
+
+  DeletionProtection:
+    Description: Enable deletion protection for the DSQL cluster
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  TemplatesBucketName:
+    Description: S3 bucket containing the nested CloudFormation templates
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - EnvironmentName
+          - TemplatesBucketName
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcCIDR
+          - PublicSubnet1CIDR
+          - PublicSubnet2CIDR
+          - PublicSubnet3CIDR
+          - SSHSourceCIDR
+      - Label:
+          default: EC2 Configuration
+        Parameters:
+          - InstanceType
+          - KeyPairName
+          - RootVolumeSize
+      - Label:
+          default: DSQL Configuration
+        Parameters:
+          - DeletionProtection
+
+Resources:
+  # VPC Infrastructure
+  VPCStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/cloudformation/vpc.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        VpcCIDR: !Ref VpcCIDR
+        PublicSubnet1CIDR: !Ref PublicSubnet1CIDR
+        PublicSubnet2CIDR: !Ref PublicSubnet2CIDR
+        PublicSubnet3CIDR: !Ref PublicSubnet3CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc-stack
+
+  # Security Groups
+  SecurityGroupsStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: VPCStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/cloudformation/security-groups.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        SSHSourceCIDR: !Ref SSHSourceCIDR
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-security-groups-stack
+
+  # IAM Resources
+  IAMStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/cloudformation/iam.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-iam-stack
+
+  # Aurora DSQL Cluster
+  DSQLStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/cloudformation/dsql.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        DeletionProtection: !Ref DeletionProtection
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-dsql-stack
+
+  # EC2 Instances
+  EC2Stack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - VPCStack
+      - SecurityGroupsStack
+      - IAMStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.amazonaws.com/cloudformation/ec2.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        InstanceType: !Ref InstanceType
+        KeyPairName: !Ref KeyPairName
+        RootVolumeSize: !Ref RootVolumeSize
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ec2-stack
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !GetAtt VPCStack.Outputs.VPC
+
+  DSQLClusterEndpoint:
+    Description: Aurora DSQL Cluster Endpoint
+    Value: !GetAtt DSQLStack.Outputs.DSQLClusterEndpoint
+
+  BenchmarkInstance1PublicIp:
+    Description: Public IP for benchmark instance 1 (us-east-1a)
+    Value: !GetAtt EC2Stack.Outputs.BenchmarkInstance1PublicIp
+
+  BenchmarkInstance2PublicIp:
+    Description: Public IP for benchmark instance 2 (us-east-1b)
+    Value: !GetAtt EC2Stack.Outputs.BenchmarkInstance2PublicIp
+
+  BenchmarkInstance3PublicIp:
+    Description: Public IP for benchmark instance 3 (us-east-1c)
+    Value: !GetAtt EC2Stack.Outputs.BenchmarkInstance3PublicIp
+
+  SSHCommands:
+    Description: SSH commands to connect to benchmark instances
+    Value: !Sub |
+      Instance 1 (us-east-1a): ssh -i ${KeyPairName}.pem ec2-user@${EC2Stack.Outputs.BenchmarkInstance1PublicIp}
+      Instance 2 (us-east-1b): ssh -i ${KeyPairName}.pem ec2-user@${EC2Stack.Outputs.BenchmarkInstance2PublicIp}
+      Instance 3 (us-east-1c): ssh -i ${KeyPairName}.pem ec2-user@${EC2Stack.Outputs.BenchmarkInstance3PublicIp}
