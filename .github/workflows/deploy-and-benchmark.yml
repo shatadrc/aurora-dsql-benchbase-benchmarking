@@ -1,0 +1,342 @@
+name: Deploy and Benchmark DSQL
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment_name:
+        description: 'Environment name prefix for resources'
+        required: true
+        default: 'dsql-benchmark'
+        type: string
+      warehouse_count:
+        description: 'Number of TPC-C warehouses'
+        required: true
+        default: '20'
+        type: string
+      cleanup_after:
+        description: 'Tear down infrastructure after benchmark'
+        required: true
+        default: false
+        type: boolean
+      execution_time:
+        description: 'Benchmark execution time in seconds'
+        required: true
+        default: '3600'
+        type: string
+      warmup_time:
+        description: 'Warmup time in seconds'
+        required: true
+        default: '600'
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  TEMPLATES_BUCKET: ${{ inputs.environment_name }}-cf-templates
+
+jobs:
+  deploy:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    outputs:
+      dsql_endpoint: ${{ steps.get-outputs.outputs.dsql_endpoint }}
+      instance1_ip: ${{ steps.get-outputs.outputs.instance1_ip }}
+      instance2_ip: ${{ steps.get-outputs.outputs.instance2_ip }}
+      instance3_ip: ${{ steps.get-outputs.outputs.instance3_ip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create S3 bucket for templates
+        run: |
+          aws s3 mb s3://${{ env.TEMPLATES_BUCKET }} --region ${{ env.AWS_REGION }} || true
+
+      - name: Upload CloudFormation templates to S3
+        run: |
+          aws s3 sync infrastructure/cloudformation/ s3://${{ env.TEMPLATES_BUCKET }}/cloudformation/
+
+      - name: Deploy VPC Stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ inputs.environment_name }}-vpc \
+            --template-file infrastructure/cloudformation/vpc.yaml \
+            --parameter-overrides EnvironmentName=${{ inputs.environment_name }} \
+            --no-fail-on-empty-changeset
+
+      - name: Deploy Security Groups Stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ inputs.environment_name }}-security-groups \
+            --template-file infrastructure/cloudformation/security-groups.yaml \
+            --parameter-overrides EnvironmentName=${{ inputs.environment_name }} \
+            --no-fail-on-empty-changeset
+
+      - name: Deploy IAM Stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ inputs.environment_name }}-iam \
+            --template-file infrastructure/cloudformation/iam.yaml \
+            --parameter-overrides EnvironmentName=${{ inputs.environment_name }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Deploy DSQL Stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ inputs.environment_name }}-dsql \
+            --template-file infrastructure/cloudformation/dsql.yaml \
+            --parameter-overrides EnvironmentName=${{ inputs.environment_name }} \
+            --no-fail-on-empty-changeset
+
+      - name: Deploy EC2 Stack
+        run: |
+          aws cloudformation deploy \
+            --stack-name ${{ inputs.environment_name }}-ec2 \
+            --template-file infrastructure/cloudformation/ec2.yaml \
+            --parameter-overrides \
+              EnvironmentName=${{ inputs.environment_name }} \
+              KeyPairName=${{ secrets.EC2_KEY_PAIR_NAME }} \
+            --no-fail-on-empty-changeset
+
+      - name: Get Stack Outputs
+        id: get-outputs
+        run: |
+          DSQL_ENDPOINT=$(aws cloudformation describe-stacks \
+            --stack-name ${{ inputs.environment_name }}-dsql \
+            --query 'Stacks[0].Outputs[?OutputKey==`DSQLClusterEndpoint`].OutputValue' \
+            --output text)
+          echo "dsql_endpoint=$DSQL_ENDPOINT" >> $GITHUB_OUTPUT
+          
+          INSTANCE1_IP=$(aws cloudformation describe-stacks \
+            --stack-name ${{ inputs.environment_name }}-ec2 \
+            --query 'Stacks[0].Outputs[?OutputKey==`BenchmarkInstance1PublicIp`].OutputValue' \
+            --output text)
+          echo "instance1_ip=$INSTANCE1_IP" >> $GITHUB_OUTPUT
+          
+          INSTANCE2_IP=$(aws cloudformation describe-stacks \
+            --stack-name ${{ inputs.environment_name }}-ec2 \
+            --query 'Stacks[0].Outputs[?OutputKey==`BenchmarkInstance2PublicIp`].OutputValue' \
+            --output text)
+          echo "instance2_ip=$INSTANCE2_IP" >> $GITHUB_OUTPUT
+          
+          INSTANCE3_IP=$(aws cloudformation describe-stacks \
+            --stack-name ${{ inputs.environment_name }}-ec2 \
+            --query 'Stacks[0].Outputs[?OutputKey==`BenchmarkInstance3PublicIp`].OutputValue' \
+            --output text)
+          echo "instance3_ip=$INSTANCE3_IP" >> $GITHUB_OUTPUT
+
+      - name: Display deployment info
+        run: |
+          echo "DSQL Endpoint: ${{ steps.get-outputs.outputs.dsql_endpoint }}"
+          echo "Instance 1 IP: ${{ steps.get-outputs.outputs.instance1_ip }}"
+          echo "Instance 2 IP: ${{ steps.get-outputs.outputs.instance2_ip }}"
+          echo "Instance 3 IP: ${{ steps.get-outputs.outputs.instance3_ip }}"
+
+  benchmark:
+    name: Execute Benchmark
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/benchmark_key
+          chmod 600 ~/.ssh/benchmark_key
+          echo "StrictHostKeyChecking no" >> ~/.ssh/config
+
+      - name: Wait for EC2 instances to be ready
+        run: |
+          echo "Waiting for EC2 instances to complete setup (5 minutes)..."
+          sleep 300
+          for IP in "${{ needs.deploy.outputs.instance1_ip }}" "${{ needs.deploy.outputs.instance2_ip }}" "${{ needs.deploy.outputs.instance3_ip }}"; do
+            echo "Checking $IP..."
+            for i in {1..30}; do
+              if ssh -i ~/.ssh/benchmark_key ec2-user@$IP "test -f /opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql/benchbase.jar" 2>/dev/null; then
+                echo "Instance $IP is ready"
+                break
+              fi
+              echo "Waiting for instance $IP to be ready... (attempt $i/30)"
+              sleep 30
+            done
+          done
+
+      - name: Run initialization on Instance 1
+        run: |
+          ssh -i ~/.ssh/benchmark_key ec2-user@${{ needs.deploy.outputs.instance1_ip }} << 'EOF'
+          source /opt/benchmark/benchmark-env.sh
+          cd /opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql
+          java -jar benchbase.jar -b tpcc \
+            -c config/auroradsql/sample_tpcc_config.xml \
+            --url "jdbc:postgresql://${{ needs.deploy.outputs.dsql_endpoint }}:5432/postgres?sslmode=require&ApplicationName=tpcc&reWriteBatchedInserts=true" \
+            --region ${{ env.AWS_REGION }} \
+            --scalefactor ${{ inputs.warehouse_count }} \
+            --create true --load true --execute false \
+            --skipMainDataLoad true --clear true
+          EOF
+          echo "Waiting 30 seconds for schema propagation..."
+          sleep 30
+
+      - name: Run distributed data loading
+        run: |
+          COMMON_ARGS="--url jdbc:postgresql://${{ needs.deploy.outputs.dsql_endpoint }}:5432/postgres?sslmode=require&ApplicationName=tpcc&reWriteBatchedInserts=true --region ${{ env.AWS_REGION }} --scalefactor ${{ inputs.warehouse_count }}"
+          
+          for i in 1 2 3; do
+            eval "IP=\${{ needs.deploy.outputs.instance${i}_ip }}"
+            ssh -i ~/.ssh/benchmark_key ec2-user@$IP << EOF &
+          source /opt/benchmark/benchmark-env.sh
+          cd /opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql
+          java -jar benchbase.jar -b tpcc -c config/auroradsql/sample_tpcc_config.xml \
+            $COMMON_ARGS --create false --load true --execute false \
+            --skipItemLoad true --startWarehouseIndex $i --endWarehouseIndex ${{ inputs.warehouse_count }} --stride 3
+          EOF
+          done
+          wait
+          echo "Data loading completed on all instances"
+
+      - name: Coordinate benchmark execution
+        run: |
+          START_TIME=$(date -u -d "+60 seconds" +%s)
+          echo "Benchmark will start at Unix timestamp: $START_TIME"
+          
+          for i in 1 2 3; do
+            eval "IP=\${{ needs.deploy.outputs.instance${i}_ip }}"
+            ssh -i ~/.ssh/benchmark_key ec2-user@$IP << EOF &
+          source /opt/benchmark/benchmark-env.sh
+          cd /opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql
+          
+          TERMINALS=\$(( (${{ inputs.warehouse_count }} - $i) / 3 + 1 ))
+          
+          while [ \$(date +%s) -lt $START_TIME ]; do sleep 1; done
+          
+          java -jar benchbase.jar -b tpcc -c config/auroradsql/sample_tpcc_config.xml \
+            --url "jdbc:postgresql://${{ needs.deploy.outputs.dsql_endpoint }}:5432/postgres?sslmode=require&ApplicationName=tpcc&reWriteBatchedInserts=true" \
+            --region ${{ env.AWS_REGION }} --scalefactor ${{ inputs.warehouse_count }} \
+            --create false --load false --execute true \
+            --startWarehouseIndex $i --endWarehouseIndex ${{ inputs.warehouse_count }} \
+            --stride 3 --terminals \$TERMINALS \
+            --time ${{ inputs.execution_time }} --warmup ${{ inputs.warmup_time }}
+          EOF
+          done
+          wait
+          echo "Benchmark execution completed on all instances"
+
+  collect-results:
+    name: Collect Results
+    needs: [deploy, benchmark]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/benchmark_key
+          chmod 600 ~/.ssh/benchmark_key
+          echo "StrictHostKeyChecking no" >> ~/.ssh/config
+
+      - name: Collect results from all instances
+        run: |
+          mkdir -p results/instance1 results/instance2 results/instance3
+          
+          scp -i ~/.ssh/benchmark_key "ec2-user@${{ needs.deploy.outputs.instance1_ip }}:/opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql/results*" results/instance1/ || true
+          scp -i ~/.ssh/benchmark_key "ec2-user@${{ needs.deploy.outputs.instance2_ip }}:/opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql/results*" results/instance2/ || true
+          scp -i ~/.ssh/benchmark_key "ec2-user@${{ needs.deploy.outputs.instance3_ip }}:/opt/benchmark/aurora-dsql-benchbase-benchmarking/target/benchbase-auroradsql/results*" results/instance3/ || true
+
+      - name: Generate summary report
+        run: |
+          echo "# DSQL Benchmark Results Summary" > results/summary.md
+          echo "" >> results/summary.md
+          echo "**Environment:** ${{ inputs.environment_name }}" >> results/summary.md
+          echo "**Warehouses:** ${{ inputs.warehouse_count }}" >> results/summary.md
+          echo "**Execution Time:** ${{ inputs.execution_time }}s" >> results/summary.md
+          echo "**Warmup Time:** ${{ inputs.warmup_time }}s" >> results/summary.md
+          echo "**DSQL Endpoint:** ${{ needs.deploy.outputs.dsql_endpoint }}" >> results/summary.md
+          echo "" >> results/summary.md
+          echo "## Results by Instance" >> results/summary.md
+          
+          TOTAL_TPS=0
+          for i in 1 2 3; do
+            echo "" >> results/summary.md
+            echo "### Instance $i" >> results/summary.md
+            if [ -f "results/instance$i/"*".summary.json" ]; then
+              TPS=$(cat results/instance$i/*.summary.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('Throughput (requests/second)', 'N/A'))" 2>/dev/null || echo "N/A")
+              echo "Throughput: $TPS requests/second" >> results/summary.md
+              if [ "$TPS" != "N/A" ]; then
+                TOTAL_TPS=$(echo "$TOTAL_TPS + $TPS" | bc -l 2>/dev/null || echo "$TOTAL_TPS")
+              fi
+            else
+              echo "No results found" >> results/summary.md
+            fi
+          done
+          
+          echo "" >> results/summary.md
+          echo "## Aggregate Results" >> results/summary.md
+          echo "**Total Throughput:** $TOTAL_TPS requests/second" >> results/summary.md
+          
+          cat results/summary.md
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ inputs.environment_name }}-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+
+  cleanup:
+    name: Cleanup Infrastructure
+    needs: [deploy, collect-results]
+    if: ${{ inputs.cleanup_after == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Delete EC2 Stack
+        run: |
+          aws cloudformation delete-stack --stack-name ${{ inputs.environment_name }}-ec2
+          aws cloudformation wait stack-delete-complete --stack-name ${{ inputs.environment_name }}-ec2
+
+      - name: Delete DSQL Stack
+        run: |
+          aws cloudformation delete-stack --stack-name ${{ inputs.environment_name }}-dsql
+          aws cloudformation wait stack-delete-complete --stack-name ${{ inputs.environment_name }}-dsql
+
+      - name: Delete IAM Stack
+        run: |
+          aws cloudformation delete-stack --stack-name ${{ inputs.environment_name }}-iam
+          aws cloudformation wait stack-delete-complete --stack-name ${{ inputs.environment_name }}-iam
+
+      - name: Delete Security Groups Stack
+        run: |
+          aws cloudformation delete-stack --stack-name ${{ inputs.environment_name }}-security-groups
+          aws cloudformation wait stack-delete-complete --stack-name ${{ inputs.environment_name }}-security-groups
+
+      - name: Delete VPC Stack
+        run: |
+          aws cloudformation delete-stack --stack-name ${{ inputs.environment_name }}-vpc
+          aws cloudformation wait stack-delete-complete --stack-name ${{ inputs.environment_name }}-vpc
+
+      - name: Delete S3 bucket
+        run: |
+          aws s3 rb s3://${{ env.TEMPLATES_BUCKET }} --force || true
+
+      - name: Cleanup complete
+        run: echo "All infrastructure has been torn down successfully"

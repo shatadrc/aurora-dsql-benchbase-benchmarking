@@ -47,6 +47,52 @@ The infrastructure creates:
    - 3 x c5.2xlarge instances
    - Aurora DSQL cluster
 
+### GitHub Actions Workflow (Recommended)
+
+The easiest way to deploy and run benchmarks is using the GitHub Actions workflow.
+
+#### Required GitHub Secrets
+
+Configure the following secrets in your repository (Settings > Secrets and variables > Actions):
+
+| Secret Name | Description | Example |
+|-------------|-------------|---------|
+| `AWS_ACCESS_KEY_ID` | AWS access key with CloudFormation, EC2, DSQL, and S3 permissions | `AKIAIOSFODNN7EXAMPLE` |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret access key | `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` |
+| `AWS_REGION` | AWS region for deployment (optional, defaults to us-east-1) | `us-east-1` |
+| `EC2_KEY_PAIR_NAME` | Name of existing EC2 key pair in the target region | `my-benchmark-keypair` |
+| `SSH_PRIVATE_KEY` | Private key content for SSH access to EC2 instances | `-----BEGIN RSA PRIVATE KEY-----...` |
+
+#### Triggering the Workflow
+
+1. Go to **Actions** tab in your repository
+2. Select **Deploy and Benchmark DSQL** workflow
+3. Click **Run workflow**
+4. Configure the parameters:
+   - **Environment name**: Prefix for AWS resources (default: `dsql-benchmark`)
+   - **Warehouse count**: Number of TPC-C warehouses (default: `20`)
+   - **Cleanup after**: Whether to tear down infrastructure after benchmark
+   - **Execution time**: Benchmark duration in seconds (default: `3600`)
+   - **Warmup time**: Warmup period in seconds (default: `600`)
+5. Click **Run workflow**
+
+#### Workflow Jobs
+
+The workflow consists of four jobs:
+
+1. **Deploy Infrastructure**: Creates VPC, Security Groups, IAM, DSQL cluster, and EC2 instances
+2. **Execute Benchmark**: Initializes schema, loads data, and runs distributed TPC-C benchmark
+3. **Collect Results**: Gathers results from all instances and generates summary report
+4. **Cleanup (Optional)**: Tears down all infrastructure if `cleanup_after` is enabled
+
+#### Accessing Results
+
+Benchmark results are uploaded as workflow artifacts and can be downloaded from the workflow run page.
+
+### Manual Deployment
+
+If you prefer to deploy manually, use the scripts below.
+
 ### Deploy Infrastructure
 
 ```bash
